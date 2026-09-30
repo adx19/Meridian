@@ -1,0 +1,1544 @@
+diff --git a/backend/app/api/routes/intelligence.py b/backend/app/api/routes/intelligence.py
+index 094843c..7d62bf5 100644
+--- a/backend/app/api/routes/intelligence.py
++++ b/backend/app/api/routes/intelligence.py
+@@ -1,6 +1,10 @@
++import logging
++import traceback
++from time import perf_counter
++
+ from fastapi import APIRouter, Depends, HTTPException, status
+ from sqlalchemy.orm import Session
+-import traceback
++
+ from app.db.database import get_db
+ from app.models.commits import Commit
+ from app.models.repository import Repository
+@@ -8,7 +12,40 @@ from app.schemas.repository_intelligence import RepositoryIntelligenceResponse
+ from app.services.intelligence_service import get_or_generate_repository_intelligence
+ 
+ router = APIRouter()
++logger = logging.getLogger(__name__)
++
++
++def _format_duration(seconds: float) -> str:
++    if seconds >= 1:
++        return f"{seconds:.2f} s"
++    return f"{seconds * 1000:.0f} ms"
++
++
++def _log_timing(repo_name: str, timings: dict[str, float | str]) -> None:
++    total = perf_counter() - timings["request_started_at"]
++    lines = [
++        "--------------------------------------------------",
++        "Repository Intelligence Timing",
++        f"Repository: {repo_name}",
++        "",
++        f"Cache lookup: {_format_duration(timings.get('cache_lookup', 0.0))}",
++        str(timings.get("cache_status", "Cache not reached")),
++    ]
+ 
++    if timings.get("cache_status") == "Cache miss":
++        lines.extend([
++            "",
++            f"Repository lookup: {_format_duration(timings.get('repository_lookup', 0.0))}",
++            f"README retrieval: {_format_duration(timings.get('readme_retrieval', 0.0))}",
++            f"Commit retrieval: {_format_duration(timings.get('commit_retrieval', 0.0))}",
++            f"Prompt construction: {_format_duration(timings.get('prompt_construction', 0.0))}",
++            f"Gemini generation: {_format_duration(timings.get('gemini_generation', 0.0))}",
++            f"JSON parsing: {_format_duration(timings.get('json_parsing', 0.0))}",
++            f"Database save: {_format_duration(timings.get('database_save', 0.0))}",
++        ])
++
++    lines.extend(["", f"TOTAL: {_format_duration(total)}", "--------------------------------------------------"])
++    logger.info("\n%s", "\n".join(lines))
+ 
+ @router.get(
+     "/repository/{repo_name}",
+@@ -19,34 +56,46 @@ def get_repository_intelligence(
+     user_id: int,
+     db: Session = Depends(get_db)
+ ):
+-    repo = (
+-        db.query(Repository)
+-        .filter(
+-            Repository.name == repo_name,
+-            Repository.user_id == user_id
+-        )
+-        .first()
+-    )
++    timings: dict[str, float | str] = {"request_started_at": perf_counter()}
+ 
+-    if not repo:
+-        raise HTTPException(
+-            status_code=status.HTTP_404_NOT_FOUND,
+-            detail="Repository not found."
++    try:
++        stage_started_at = perf_counter()
++        repo = (
++            db.query(Repository)
++            .filter(
++                Repository.name == repo_name,
++                Repository.user_id == user_id
++            )
++            .first()
+         )
++        timings["repository_lookup"] = perf_counter() - stage_started_at
+ 
+-    commits = (
+-        db.query(Commit)
+-        .filter(Commit.repository_id == repo.id)
+-        .order_by(Commit.commit_timestamp.desc())
+-        .limit(20)
+-        .all()
+-    )
++        if not repo:
++            raise HTTPException(
++                status_code=status.HTTP_404_NOT_FOUND,
++                detail="Repository not found."
++            )
+ 
+-    try:
+-        intelligence = get_or_generate_repository_intelligence(repo, commits, db)
+-    except RuntimeError as exc:
++        stage_started_at = perf_counter()
++        _ = repo.readme
++        timings["readme_retrieval"] = perf_counter() - stage_started_at
++
++        stage_started_at = perf_counter()
++        commits = (
++            db.query(Commit)
++            .filter(Commit.repository_id == repo.id)
++            .order_by(Commit.commit_timestamp.desc())
++            .limit(20)
++            .all()
++        )
++        timings["commit_retrieval"] = perf_counter() - stage_started_at
++
++        intelligence = get_or_generate_repository_intelligence(repo, commits, db, timings)
++        return intelligence
++    except RuntimeError:
+         print("\n========== ERROR ==========")
+         traceback.print_exc()
+         print("===========================\n")
+         raise
+-    return intelligence
+\ No newline at end of file
++    finally:
++        _log_timing(repo_name, timings)
+\ No newline at end of file
+diff --git a/backend/app/services/ai_service.py b/backend/app/services/ai_service.py
+index 9cc5c78..4533b68 100644
+--- a/backend/app/services/ai_service.py
++++ b/backend/app/services/ai_service.py
+@@ -1,5 +1,6 @@
+ from app.services.ai_providers.gemini_provider import (generate_with_gemini)
+ import json
++from time import perf_counter
+ AI_PROVIDER = "gemini"
+ 
+ 
+@@ -9,24 +10,31 @@ def test_gemini():
+     )
+ 
+ 
+-def generate_repository_intelligence(repository, commits):
++def generate_repository_intelligence(repository, commits, timings=None):
++  timings = timings if timings is not None else {}
+   if AI_PROVIDER != "gemini":
+     raise Exception(f"Unsupported AI provider: {AI_PROVIDER}")
+ 
+ 
+   print("USING GEMINI")
++  prompt_started_at = perf_counter()
+   prompt = build_intelligence_prompt(repository, commits)
++  timings["prompt_construction"] = perf_counter() - prompt_started_at
+   print("\n" + "=" * 80)
+   print("PROMPT SENT TO GEMINI")
+   print("=" * 80)
+   print(prompt)
+   print("=" * 80 + "\n")
++  gemini_started_at = perf_counter()
+   response = generate_with_gemini(prompt)
++  timings["gemini_generation"] = perf_counter() - gemini_started_at
++  parsing_started_at = perf_counter()
+   response = response.replace("```json", "")
+   response = response.replace("```" ,"")
+   response = response.strip()
+ 
+   data = json.loads(response)
++  timings["json_parsing"] = perf_counter() - parsing_started_at
+ 
+   return data;
+ 
+diff --git a/backend/app/services/intelligence_service.py b/backend/app/services/intelligence_service.py
+index 2e218ed..7f69a0b 100644
+--- a/backend/app/services/intelligence_service.py
++++ b/backend/app/services/intelligence_service.py
+@@ -1,6 +1,8 @@
+ import logging
+ from datetime import datetime, timezone
++from time import perf_counter
+ 
++from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.orm import Session
+ 
+ from app.models.commits import Commit
+@@ -11,18 +13,31 @@ from app.services.ai_service import generate_repository_intelligence
+ logger = logging.getLogger(__name__)
+ 
+ 
+-def get_or_generate_repository_intelligence(repository: Repository, commits, db: Session):
++def get_or_generate_repository_intelligence(repository: Repository, commits, db: Session, timings: dict | None = None):
++    timings = timings if timings is not None else {}
++    cache_started_at = perf_counter()
++    locked_repository = (
++        db.query(Repository)
++        .filter(Repository.id == repository.id)
++        .with_for_update()
++        .one()
++    )
++
+     existing = (
+         db.query(RepositoryIntelligence)
+-        .filter(RepositoryIntelligence.repository_id == repository.id)
++        .filter(RepositoryIntelligence.repository_id == locked_repository.id)
+         .first()
+     )
+ 
++    timings["cache_lookup"] = perf_counter() - cache_started_at
++
+     if existing:
+-        logger.info("[Repository Intelligence] Cache hit for repository %s", repository.id)
++        timings["cache_status"] = "Cache hit"
++        logger.info("[Repository Intelligence] Cache hit for repository %s", locked_repository.id)
+         return existing
+ 
+-    logger.info("[Repository Intelligence] Cache miss for repository %s", repository.id)
++    timings["cache_status"] = "Cache miss"
++    logger.info("[Repository Intelligence] Cache miss for repository %s", locked_repository.id)
+     logger.info("Generating intelligence with Gemini...")
+ 
+     if commits is None:
+@@ -35,7 +50,7 @@ def get_or_generate_repository_intelligence(repository: Repository, commits, db:
+         )
+ 
+     try:
+-        ai_result = generate_repository_intelligence(repository, commits)
++        ai_result = generate_repository_intelligence(locked_repository, commits, timings)
+     except Exception as exc:
+         db.rollback()
+         raise RuntimeError(
+@@ -55,7 +70,7 @@ def get_or_generate_repository_intelligence(repository: Repository, commits, db:
+     main_technologies = ai_result["main_technologies"]
+ 
+     intelligence = RepositoryIntelligence(
+-        repository_id=repository.id,
++        repository_id=locked_repository.id,
+         summary=summary,
+         development_update=development_update,
+         current_focus=current_focus,
+@@ -65,14 +80,27 @@ def get_or_generate_repository_intelligence(repository: Repository, commits, db:
+         main_technologies=main_technologies,
+         generated_at=datetime.now(timezone.utc),
+     )
++    save_started_at = perf_counter()
+     try:
+         db.add(intelligence)
+         db.commit()
+         db.refresh(intelligence)
++        timings["database_save"] = perf_counter() - save_started_at
++    except IntegrityError:
++        db.rollback()
++        existing = (
++            db.query(RepositoryIntelligence)
++            .filter(RepositoryIntelligence.repository_id == locked_repository.id)
++            .first()
++        )
++        if existing:
++            logger.info("[Repository Intelligence] Cache filled concurrently for repository %s", locked_repository.id)
++            return existing
++        raise
+     except Exception as exc:
+         db.rollback()
+         raise RuntimeError(
+-            f"Failed to save repository intelligence for repository {repository.id}: {exc}"
++            f"Failed to save repository intelligence for repository {locked_repository.id}: {exc}"
+         ) from exc
+ 
+     return intelligence
+diff --git a/backend/tests/test_intelligence_service.py b/backend/tests/test_intelligence_service.py
+index 63f6b64..a6b2a7a 100644
+--- a/backend/tests/test_intelligence_service.py
++++ b/backend/tests/test_intelligence_service.py
+@@ -4,22 +4,48 @@ import unittest
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
++from sqlalchemy.exc import IntegrityError
++
+ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+ 
+ import app.db.base  # noqa: F401
+ from app.services.intelligence_service import get_or_generate_repository_intelligence
+ 
+ 
++AI_RESULT = {
++    "summary": "summary",
++    "development_update": "recent work",
++    "project_insights": {
++        "current_focus": "focus",
++        "completed_milestones": [],
++        "potential_risks": [],
++    },
++    "next_priorities": [],
++    "main_technologies": [],
++}
++
++
++def locked_repository_query(repository):
++    query = MagicMock()
++    query.filter.return_value.with_for_update.return_value.one.return_value = repository
++    return query
++
++
++def intelligence_query(result):
++    query = MagicMock()
++    query.filter.return_value.first.return_value = result
++    return query
++
++
+ class IntelligenceServiceTests(unittest.TestCase):
+     def test_returns_existing_intelligence_without_generating(self):
+         repository = SimpleNamespace(id=1, name="demo")
+         existing = SimpleNamespace(id=10, repository_id=1)
+-
+-        intelligence_query = MagicMock()
+-        intelligence_query.filter.return_value.first.return_value = existing
+-
+         db = MagicMock()
+-        db.query.return_value = intelligence_query
++        db.query.side_effect = [
++            locked_repository_query(repository),
++            intelligence_query(existing),
++        ]
+ 
+         with patch("app.services.intelligence_service.generate_repository_intelligence") as mock_generate:
+             result = get_or_generate_repository_intelligence(repository, [], db)
+@@ -29,45 +55,52 @@ class IntelligenceServiceTests(unittest.TestCase):
+         db.add.assert_not_called()
+         db.commit.assert_not_called()
+ 
+-    @patch("app.services.intelligence_service.generate_repository_intelligence")
++    @patch("app.services.intelligence_service.generate_repository_intelligence", return_value=AI_RESULT)
+     def test_generates_and_persists_new_intelligence(self, mock_generate):
+         repository = SimpleNamespace(id=2, name="demo", description="A sample repo", language="Python")
+-        mock_generate.return_value = {
+-            "summary": "summary",
+-            "recent_work": "recent work",
+-            "main_technologies": "Python",
+-        }
+-
+-        intelligence_query = MagicMock()
+-        intelligence_query.filter.return_value.first.return_value = None
+-
+-        commit_query = MagicMock()
+-        commit_query.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
+-
+         db = MagicMock()
+-        db.query.side_effect = [intelligence_query, commit_query]
++        db.query.side_effect = [
++            locked_repository_query(repository),
++            intelligence_query(None),
++        ]
+ 
+         result = get_or_generate_repository_intelligence(repository, [], db)
+ 
+         self.assertEqual(result.repository_id, repository.id)
+         self.assertEqual(result.summary, "summary")
+         mock_generate.assert_called_once()
++        self.assertEqual(mock_generate.call_args.args[:2], (repository, []))
+         db.add.assert_called_once()
+         db.commit.assert_called_once()
+ 
+-    @patch("app.services.intelligence_service.generate_repository_intelligence")
+-    def test_rolls_back_when_generation_fails(self, mock_generate):
++    @patch("app.services.intelligence_service.generate_repository_intelligence", return_value=AI_RESULT)
++    def test_returns_cached_record_after_concurrent_insert(self, mock_generate):
+         repository = SimpleNamespace(id=3, name="demo")
+-        mock_generate.side_effect = RuntimeError("Gemini unavailable")
++        cached = SimpleNamespace(id=11, repository_id=3)
++        db = MagicMock()
++        db.query.side_effect = [
++            locked_repository_query(repository),
++            intelligence_query(None),
++            intelligence_query(cached),
++        ]
++        db.commit.side_effect = IntegrityError("INSERT", {}, Exception("duplicate key"))
+ 
+-        intelligence_query = MagicMock()
+-        intelligence_query.filter.return_value.first.return_value = None
++        result = get_or_generate_repository_intelligence(repository, [], db)
+ 
+-        commit_query = MagicMock()
+-        commit_query.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
++        self.assertIs(result, cached)
++        mock_generate.assert_called_once()
++        self.assertEqual(mock_generate.call_args.args[:2], (repository, []))
++        db.rollback.assert_called_once()
+ 
++    @patch("app.services.intelligence_service.generate_repository_intelligence")
++    def test_rolls_back_when_generation_fails(self, mock_generate):
++        repository = SimpleNamespace(id=4, name="demo")
++        mock_generate.side_effect = RuntimeError("Gemini unavailable")
+         db = MagicMock()
+-        db.query.side_effect = [intelligence_query, commit_query]
++        db.query.side_effect = [
++            locked_repository_query(repository),
++            intelligence_query(None),
++        ]
+ 
+         with self.assertRaises(RuntimeError) as context:
+             get_or_generate_repository_intelligence(repository, [], db)
+@@ -76,6 +109,5 @@ class IntelligenceServiceTests(unittest.TestCase):
+         db.rollback.assert_called_once()
+         db.commit.assert_not_called()
+ 
+-
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/frontend/app/dashboard/page.tsx b/frontend/app/dashboard/page.tsx
+index 219d82e..974de3e 100644
+--- a/frontend/app/dashboard/page.tsx
++++ b/frontend/app/dashboard/page.tsx
+@@ -8,9 +8,9 @@ import Topbar from "@/components/Topbar";
+ import StatsCard from "@/components/StatsCard";
+ import RepoCard from "@/components/RepoCard";
+ import { useSearch } from "@/app/providers";
+-import { ChevronLeft, ChevronRight } from "lucide-react";
++import { ChevronLeft, ChevronRight, FolderGit2, Search } from "lucide-react";
+ 
+-/* ── helpers ── */
++/* Ã¢â€â‚¬Ã¢â€â‚¬ helpers Ã¢â€â‚¬Ã¢â€â‚¬ */
+ function getGreeting() {
+ 	const h = new Date().getHours();
+ 	if (h < 12) return "Good morning";
+@@ -18,21 +18,21 @@ function getGreeting() {
+ 	return "Good evening";
+ }
+ 
+-/* ── skeleton components ── */
++/* Ã¢â€â‚¬Ã¢â€â‚¬ skeleton components Ã¢â€â‚¬Ã¢â€â‚¬ */
+ function HeroSkeleton() {
+ 	return (
+-		<div className="mt-10 grid lg:grid-cols-[1.4fr_0.9fr] gap-6 animate-pulse">
+-			<div className="rounded-[36px] border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02] p-10 h-64" />
+-			<div className="rounded-[36px] border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02] p-8 h-64" />
++		<div className="mt-7 grid lg:grid-cols-[1.45fr_0.85fr] gap-5 animate-pulse">
++			<div className="rounded-2xl border border-zinc-200/70 dark:border-white/[0.07] bg-zinc-100 dark:bg-white/[0.025] p-7 h-56" />
++			<div className="rounded-2xl border border-zinc-200/70 dark:border-white/[0.07] bg-zinc-100 dark:bg-white/[0.025] p-6 h-56" />
+ 		</div>
+ 	);
+ }
+ 
+ function StatsSkeleton() {
+ 	return (
+-		<div className="grid lg:grid-cols-4 gap-6 mt-8 animate-pulse">
++		<div className="grid sm:grid-cols-2 xl:grid-cols-4 gap-4 mt-5 animate-pulse">
+ 			{[...Array(4)].map((_, i) => (
+-				<div key={i} className="h-32 rounded-[24px] border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
++				<div key={i} className="h-28 rounded-lg border border-zinc-200/70 dark:border-white/[0.07] bg-zinc-100 dark:bg-white/[0.025]" />
+ 			))}
+ 		</div>
+ 	);
+@@ -40,9 +40,9 @@ function StatsSkeleton() {
+ 
+ function ReposSkeleton() {
+ 	return (
+-		<div className="grid lg:grid-cols-3 gap-6 animate-pulse">
++		<div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4 animate-pulse">
+ 			{[...Array(6)].map((_, i) => (
+-				<div key={i} className="h-44 rounded-[24px] border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
++				<div key={i} className="h-40 rounded-lg border border-zinc-200/70 dark:border-white/[0.07] bg-zinc-100 dark:bg-white/[0.025]" />
+ 			))}
+ 		</div>
+ 	);
+@@ -70,7 +70,7 @@ export default function DashboardPage() {
+ 	const [languageFilter, setLanguageFilter] = useState("All");
+ 
+ 	const repoPerPage = 12;
+-	// Fast client-side filtering — no extra network requests
++	// Fast client-side filtering Ã¢â‚¬â€ no extra network requests
+ 	const filteredRepos = useMemo(() => {
+ 		const q = searchQuery.toLowerCase();
+ 
+@@ -146,7 +146,7 @@ export default function DashboardPage() {
+ 	return (
+ 		<div className="min-h-screen bg-slate-50 dark:bg-[#030712] text-zinc-900 dark:text-white transition-colors duration-300 overflow-hidden">
+ 
+-			{/* ── ambient background ── */}
++			{/* Ã¢â€â‚¬Ã¢â€â‚¬ ambient background Ã¢â€â‚¬Ã¢â€â‚¬ */}
+ 			<div className="fixed inset-0 -z-10 overflow-hidden pointer-events-none">
+ 				<div className="absolute inset-0 bg-slate-50 dark:bg-[#030712] transition-colors duration-300" />
+ 				<div className="absolute top-[-250px] left-[10%] w-[700px] h-[700px] bg-indigo-500/6 dark:bg-indigo-500/10 blur-[180px] rounded-full" />
+@@ -158,7 +158,7 @@ export default function DashboardPage() {
+ 
+ 				<Sidebar />
+ 
+-				<div className="flex-1 px-8 py-8 h-screen overflow-y-auto">
++				<div className="flex-1 px-5 sm:px-7 xl:px-8 py-5 h-screen overflow-y-auto">
+ 
+ 					<Topbar />
+ 
+@@ -173,87 +173,87 @@ export default function DashboardPage() {
+ 						</>
+ 					) : (
+ 						<>
+-							{/* ── hero section ── */}
+-							<div className="mt-10 grid lg:grid-cols-[1.4fr_0.9fr] gap-6">
++							{/* Ã¢â€â‚¬Ã¢â€â‚¬ hero section Ã¢â€â‚¬Ã¢â€â‚¬ */}
++							<div className="mt-7 grid lg:grid-cols-[1.45fr_0.85fr] gap-5">
+ 
+ 								{/* left hero */}
+-								<div className="relative overflow-hidden rounded-[36px] border border-zinc-200/60 dark:border-white/10 bg-white dark:bg-white/[0.03] backdrop-blur-2xl p-10 shadow-sm dark:shadow-none">
+-									<div className="absolute top-[-120px] right-[-120px] w-[300px] h-[300px] bg-blue-500/10 dark:bg-blue-500/20 blur-[120px] rounded-full" />
++								<div className="relative overflow-hidden rounded-2xl border border-zinc-200/70 dark:border-white/[0.08] bg-white/80 dark:bg-white/[0.025] backdrop-blur-xl p-7 sm:p-8 shadow-sm dark:shadow-none">
++									<div className="absolute top-[-120px] right-[-120px] w-[260px] h-[260px] bg-indigo-500/10 dark:bg-indigo-500/15 blur-[110px] rounded-full" />
+ 
+ 									<div className="relative">
+-										<div className="inline-flex items-center gap-2 rounded-full border border-blue-500/20 bg-blue-500/10 px-4 py-2 text-sm text-blue-600 dark:text-blue-300">
+-											<div className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
++										<div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/10 px-3 py-1.5 text-[11px] font-medium text-indigo-600 dark:text-indigo-300">
++											<div className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+ 											Live Developer Activity
+ 										</div>
+ 
+-										<h1 className="mt-8 text-5xl font-semibold tracking-tight leading-[1.05] text-zinc-900 dark:text-white">
++										<h1 className="mt-6 text-3xl sm:text-4xl font-semibold tracking-[-0.04em] leading-[1.08] text-zinc-900 dark:text-white">
+ 											{getGreeting()},
+ 											<span className="block text-zinc-400 dark:text-zinc-500 mt-1">
+ 												{session?.user?.name?.split(" ")[0] || "Developer"}.
+ 											</span>
+ 										</h1>
+ 
+-										<p className="mt-6 text-base text-zinc-500 dark:text-zinc-400 leading-relaxed max-w-xl">
++										<p className="mt-4 text-[13px] text-zinc-500 dark:text-zinc-400 leading-relaxed max-w-xl">
+ 											{analytics.total_repos > 0
+ 												? `Meridian has indexed ${analytics.total_repos} ${analytics.total_repos === 1 ? "repository" : "repositories"} and ${analytics.total_commits} commits into your intelligence workspace.`
+ 												: "Sync your GitHub repositories to start tracking commit activity, languages, and coding patterns."}
+ 										</p>
+ 
+-										<div className="flex gap-10 mt-12">
++										<div className="flex flex-wrap gap-x-8 gap-y-4 mt-8">
+ 											<div>
+-												<h3 className="text-3xl font-semibold text-zinc-900 dark:text-white">
++												<h3 className="text-xl font-semibold tracking-[-0.03em] text-zinc-900 dark:text-white">
+ 													+{analytics.weekly_commits}
+ 												</h3>
+-												<p className="text-zinc-500 dark:text-zinc-500 mt-1 text-sm">Weekly commits</p>
++												<p className="text-zinc-500 dark:text-zinc-500 mt-1 text-[11px]">Weekly commits</p>
+ 											</div>
+ 											<div>
+-												<h3 className="text-3xl font-semibold text-zinc-900 dark:text-white">
++												<h3 className="text-xl font-semibold tracking-[-0.03em] text-zinc-900 dark:text-white">
+ 													{analytics.active_repos}
+ 												</h3>
+-												<p className="text-zinc-500 dark:text-zinc-500 mt-1 text-sm">Active repos</p>
++												<p className="text-zinc-500 dark:text-zinc-500 mt-1 text-[11px]">Active repos</p>
+ 											</div>
+ 											<div>
+-												<h3 className="text-3xl font-semibold text-zinc-900 dark:text-white">
++												<h3 className="text-xl font-semibold tracking-[-0.03em] text-zinc-900 dark:text-white">
+ 													{analytics.coding_momentum}
+ 												</h3>
+-												<p className="text-zinc-500 dark:text-zinc-500 mt-1 text-sm">Focus ratio</p>
++												<p className="text-zinc-500 dark:text-zinc-500 mt-1 text-[11px]">Focus ratio</p>
+ 											</div>
+ 										</div>
+ 									</div>
+ 								</div>
+ 
+ 								{/* insight panel */}
+-								<div className="rounded-[36px] border border-cyan-500/20 bg-cyan-500/[0.03] dark:bg-cyan-500/[0.05] backdrop-blur-2xl p-8 shadow-sm dark:shadow-none">
+-									<p className="text-cyan-600 dark:text-cyan-300 text-sm uppercase tracking-[0.25em] font-semibold">
++								<div className="rounded-2xl border border-indigo-500/15 bg-indigo-500/[0.025] dark:bg-indigo-500/[0.045] backdrop-blur-xl p-6 sm:p-7 shadow-sm dark:shadow-none">
++									<p className="text-indigo-600 dark:text-indigo-300 text-[10px] uppercase tracking-[0.14em] font-semibold">
+ 										AI Insight
+ 									</p>
+ 
+-									<h2 className="mt-6 text-2xl font-semibold leading-tight text-zinc-900 dark:text-white">
++									<h2 className="mt-4 text-[19px] font-semibold tracking-[-0.03em] leading-tight text-zinc-900 dark:text-white">
+ 										{analytics.most_active_repo !== "None"
+ 											? `${analytics.most_active_repo} is your most active repository.`
+ 											: "Sync repos to unlock insights."}
+ 									</h2>
+ 
+-									<p className="mt-4 text-zinc-500 dark:text-zinc-400 text-sm leading-relaxed">
++									<p className="mt-3 text-zinc-500 dark:text-zinc-400 text-[12px] leading-relaxed">
+ 										{analytics.most_active_repo_commits > 0
+ 											? `Detected ${analytics.most_active_repo_commits} commits synced across your most active project.`
+ 											: "Connect your repositories to see deep analytics on your development patterns."}
+ 									</p>
+ 
+-									<div className="mt-8 space-y-3">
+-										<div className="rounded-2xl border border-zinc-200/60 dark:border-white/10 bg-white/60 dark:bg-white/[0.03] p-4">
+-											<p className="text-zinc-400 dark:text-zinc-500 text-xs uppercase tracking-wider font-semibold">
++									<div className="mt-6 space-y-2.5">
++										<div className="rounded-lg border border-zinc-200/70 dark:border-white/[0.07] bg-white/70 dark:bg-white/[0.03] p-3.5">
++											<p className="text-zinc-400 dark:text-zinc-500 text-[9px] uppercase tracking-[0.14em] font-semibold">
+ 												Coding Momentum
+ 											</p>
+-											<h3 className="text-lg font-semibold mt-2 text-zinc-900 dark:text-white">
++											<h3 className="text-[15px] font-semibold mt-1.5 text-zinc-900 dark:text-white">
+ 												{analytics.coding_momentum} activity ratio
+ 											</h3>
+ 										</div>
+-										<div className="rounded-2xl border border-zinc-200/60 dark:border-white/10 bg-white/60 dark:bg-white/[0.03] p-4">
+-											<p className="text-zinc-400 dark:text-zinc-500 text-xs uppercase tracking-wider font-semibold">
++										<div className="rounded-lg border border-zinc-200/70 dark:border-white/[0.07] bg-white/70 dark:bg-white/[0.03] p-3.5">
++											<p className="text-zinc-400 dark:text-zinc-500 text-[9px] uppercase tracking-[0.14em] font-semibold">
+ 												Commit Quality
+ 											</p>
+-											<h3 className="text-lg font-semibold mt-2 text-zinc-900 dark:text-white">
++											<h3 className="text-[15px] font-semibold mt-1.5 text-zinc-900 dark:text-white">
+ 												{analytics.commit_quality} descriptive quality
+ 											</h3>
+ 										</div>
+@@ -262,8 +262,8 @@ export default function DashboardPage() {
+ 
+ 							</div>
+ 
+-							{/* ── stats row ── */}
+-							<div className="grid lg:grid-cols-4 gap-6 mt-8">
++							{/* Ã¢â€â‚¬Ã¢â€â‚¬ stats row Ã¢â€â‚¬Ã¢â€â‚¬ */}
++							<div className="grid sm:grid-cols-2 xl:grid-cols-4 gap-4 mt-5">
+ 								<StatsCard
+ 									title="Most Active Repo"
+ 									value={analytics.most_active_repo}
+@@ -290,21 +290,21 @@ export default function DashboardPage() {
+ 								/>
+ 							</div>
+ 
+-							{/* ── repositories section ── */}
+-							<div className="mt-16 pb-20">
++							{/* Ã¢â€â‚¬Ã¢â€â‚¬ repositories section Ã¢â€â‚¬Ã¢â€â‚¬ */}
++							<div className="mt-12 pb-16">
+ 
+-								<div className="flex items-end justify-between mb-8">
++								<div className="flex items-end justify-between gap-4 mb-6">
+ 									<div>
+-										<p className="text-indigo-600 dark:text-blue-300 text-sm uppercase tracking-[0.25em] font-semibold">
++										<p className="text-indigo-600 dark:text-indigo-300 text-[10px] uppercase tracking-[0.14em] font-semibold">
+ 											Repositories
+ 										</p>
+-										<h2 className="text-4xl font-semibold mt-3 tracking-tight text-zinc-900 dark:text-white">
++										<h2 className="text-xl sm:text-3xl font-semibold mt-2 tracking-[-0.04em] text-zinc-900 dark:text-white">
+ 											Your development workspace
+ 										</h2>
+ 									</div>
+ 
+ 									<div className="flex items-center gap-3">
+-										<select value={languageFilter} onChange={(e) => setLanguageFilter(e.target.value)} className="h-11 px-4 rounded-xl border border-indigo-500/40 bg-zinc-950 dark:bg-zinc-950 text-white text-sm font-medium hover:border-indigo-500/60 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-all cursor-pointer">
++										<select value={languageFilter} onChange={(e) => setLanguageFilter(e.target.value)} className="h-9 px-3 rounded-lg border border-zinc-300 dark:border-white/[0.1] bg-white dark:bg-white/[0.035] text-zinc-700 dark:text-zinc-200 text-[11px] font-medium hover:border-indigo-500/45 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 transition-all cursor-pointer">
+ 											{availableLanguages.map((lang) => (
+ 												<option key={lang} value={lang}>{lang}</option>
+ 											))}
+@@ -314,34 +314,34 @@ export default function DashboardPage() {
+ 
+ 								{filteredRepos.length === 0 && repos.length > 0 ? (
+ 									/* Search returned no results */
+-									<div className="rounded-[28px] border border-dashed border-zinc-300 dark:border-white/10 bg-zinc-50 dark:bg-white/[0.02] p-16 text-center">
+-										<div className="w-14 h-14 rounded-2xl bg-indigo-500/10 flex items-center justify-center mx-auto mb-4">
+-											<span className="text-2xl">🔍</span>
++									<div className="rounded-2xl border border-dashed border-zinc-300 dark:border-white/[0.1] bg-zinc-50/70 dark:bg-white/[0.02] p-10 sm:p-14 text-center">
++										<div className="w-12 h-12 rounded-lg bg-indigo-500/10 flex items-center justify-center mx-auto mb-4">
++											<Search size={19} className="text-indigo-500" />
+ 										</div>
+-										<h3 className="text-lg font-semibold text-zinc-700 dark:text-zinc-300">
++										<h3 className="text-[15px] font-semibold text-zinc-700 dark:text-zinc-300">
+ 											No repositories matched &quot;{searchQuery}&quot;
+ 										</h3>
+-										<p className="text-zinc-400 dark:text-zinc-500 text-sm mt-2 max-w-xs mx-auto">
++										<p className="text-zinc-400 dark:text-zinc-500 text-[12px] mt-2 max-w-xs mx-auto">
+ 											Try a different name, description, or language.
+ 										</p>
+ 									</div>
+ 								) : filteredRepos.length === 0 ? (
+ 									/* No repos synced at all */
+-									<div className="rounded-[28px] border border-dashed border-zinc-300 dark:border-white/10 bg-zinc-50 dark:bg-white/[0.02] p-16 text-center">
+-										<div className="w-14 h-14 rounded-2xl bg-indigo-500/10 flex items-center justify-center mx-auto mb-4">
+-											<span className="text-2xl">🗂</span>
++									<div className="rounded-2xl border border-dashed border-zinc-300 dark:border-white/[0.1] bg-zinc-50/70 dark:bg-white/[0.02] p-10 sm:p-14 text-center">
++										<div className="w-12 h-12 rounded-lg bg-indigo-500/10 flex items-center justify-center mx-auto mb-4">
++											<FolderGit2 size={19} className="text-indigo-500" />
+ 										</div>
+-										<h3 className="text-lg font-semibold text-zinc-700 dark:text-zinc-300">
++										<h3 className="text-[15px] font-semibold text-zinc-700 dark:text-zinc-300">
+ 											No repositories synced yet
+ 										</h3>
+-										<p className="text-zinc-400 dark:text-zinc-500 text-sm mt-2 max-w-xs mx-auto">
++										<p className="text-zinc-400 dark:text-zinc-500 text-[12px] mt-2 max-w-xs mx-auto">
+ 											GitHub repositories will appear here once the sync completes. This happens automatically on load.
+ 										</p>
+ 									</div>
+ 
+ 								) : (
+ 									<>
+-										<div className="grid lg:grid-cols-3 gap-6">
++										<div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4">
+ 											{currentRepos.map((repo) => (
+ 												<RepoCard
+ 													key={repo.id}
+@@ -353,13 +353,13 @@ export default function DashboardPage() {
+ 												/>
+ 											))}
+ 										</div>
+-										<div className="flex justify-center items-center gap-3 mt-10">
++										<div className="flex justify-center items-center gap-2 mt-8">
+ 											<button
+ 												disabled={currentPage === 1}
+ 												onClick={() => setCurrentPage((p) => p - 1)}
+ 												className="
+-												w-11 h-11
+-												rounded-xl
++												w-9 h-9
++												rounded-lg
+ 												border border-white/10
+ 												bg-white/[0.03]
+ 												disabled:opacity-40
+@@ -377,7 +377,7 @@ export default function DashboardPage() {
+ 												<button
+ 													key={page}
+ 													onClick={() => setCurrentPage(page)}
+-													className={`w-11 h-11 rounded-xl transition-all ${currentPage === page ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/30" : "border border-white/10 bg-white/[0.03] hover:bg-white/[0.06]"}`}
++													className={`w-9 h-9 rounded-lg transition-all ${currentPage === page ? "bg-indigo-600 text-white shadow-sm" : "border border-white/10 bg-white/[0.03] hover:bg-white/[0.06]"}`}
+ 												>
+ 													{page}
+ 												</button>
+@@ -386,8 +386,8 @@ export default function DashboardPage() {
+ 												disabled={currentPage === totalPages}
+ 												onClick={() => setCurrentPage((p) => p + 1)}
+ 												className="
+-												w-11 h-11
+-												rounded-xl
++												w-9 h-9
++												rounded-lg
+ 												border border-white/10
+ 												bg-white/[0.03]
+ 												disabled:opacity-40
+diff --git a/frontend/app/globals.css b/frontend/app/globals.css
+index 67e7454..551f29f 100644
+--- a/frontend/app/globals.css
++++ b/frontend/app/globals.css
+@@ -3,7 +3,9 @@
+ @tailwind utilities;
+ 
+ @layer base {
+-  /* ── Dark mode (default) ── */
++  :root { --border-subtle: rgba(255, 255, 255, 0.075); }
++  * { border-color: var(--border-subtle); }
++  html { font-size: 93.75%; scroll-behavior: smooth; }
+   body {
+     background-color: #030712;
+     background-image:
+@@ -12,10 +14,12 @@
+       radial-gradient(at 50% 0%, rgba(139, 92, 246, 0.05) 0px, transparent 50%);
+     color: #f3f4f6;
+     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+-    transition: background-color 0.3s ease, color 0.3s ease;
++    text-rendering: optimizeLegibility;
++    transition: background-color 180ms ease, color 180ms ease;
+   }
+ 
+-  /* ── Light mode override ── */
++  button, a, input { transition: color 160ms ease, background-color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease; }
++  button:focus-visible, a:focus-visible, input:focus-visible { outline: 2px solid rgba(129, 140, 248, 0.9); outline-offset: 2px; }
+   html.light body {
+     background-color: #f8fafc;
+     background-image:
+@@ -24,10 +28,10 @@
+     color: #0f172a;
+   }
+ 
+-  /* ── Scrollbars: dark ── */
++  /* Ã¢â€â‚¬Ã¢â€â‚¬ Scrollbars: dark Ã¢â€â‚¬Ã¢â€â‚¬ */
+   ::-webkit-scrollbar {
+-    width: 6px;
+-    height: 6px;
++    width: 8px;
++    height: 8px;
+   }
+   ::-webkit-scrollbar-track {
+     background: rgba(3, 7, 18, 0.6);
+@@ -40,7 +44,7 @@
+     background: rgba(99, 102, 241, 0.4);
+   }
+ 
+-  /* ── Scrollbars: light ── */
++  /* Ã¢â€â‚¬Ã¢â€â‚¬ Scrollbars: light Ã¢â€â‚¬Ã¢â€â‚¬ */
+   html.light ::-webkit-scrollbar-track {
+     background: rgba(241, 245, 249, 0.8);
+   }
+@@ -52,7 +56,7 @@
+   }
+ }
+ 
+-/* ── Skeleton shimmer animation ── */
++/* Ã¢â€â‚¬Ã¢â€â‚¬ Skeleton shimmer animation Ã¢â€â‚¬Ã¢â€â‚¬ */
+ @keyframes shimmer {
+   0%   { background-position: -600px 0; }
+   100% { background-position: 600px 0; }
+diff --git a/frontend/app/repo/[name]/page.tsx b/frontend/app/repo/[name]/page.tsx
+index dd2ef7e..0c7bc6d 100644
+--- a/frontend/app/repo/[name]/page.tsx
++++ b/frontend/app/repo/[name]/page.tsx
+@@ -11,18 +11,18 @@ import Topbar from "@/components/Topbar";
+ /* ── skeleton ── */
+ function HeroSkeleton() {
+ 	return (
+-		<div className="mt-10 grid lg:grid-cols-[1.4fr_0.9fr] gap-6 animate-pulse">
+-			<div className="h-72 rounded-[36px] border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
+-			<div className="h-72 rounded-[36px] border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
++		<div className="mt-7 grid lg:grid-cols-[1.4fr_0.9fr] gap-5 animate-pulse">
++			<div className="h-60 rounded-2xl border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
++			<div className="h-60 rounded-2xl border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
+ 		</div>
+ 	);
+ }
+ 
+ function CommitsSkeleton() {
+ 	return (
+-		<div className="space-y-5 animate-pulse">
++		<div className="space-y-4 animate-pulse">
+ 			{[...Array(4)].map((_, i) => (
+-				<div key={i} className="h-28 rounded-[28px] border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
++				<div key={i} className="h-24 rounded-xl border border-zinc-200/50 dark:border-white/5 bg-zinc-100 dark:bg-white/[0.02]" />
+ 			))}
+ 		</div>
+ 	);
+@@ -52,18 +52,18 @@ function normalizeText(value: unknown, fallback: string): string {
+ 
+ function SectionCard({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
+ 	return (
+-		<div className="rounded-[28px] border border-zinc-200/60 dark:border-white/10 bg-white dark:bg-white/[0.03] backdrop-blur-2xl p-7 shadow-sm dark:shadow-none">
++		<div className="rounded-xl border border-zinc-200/60 dark:border-white/10 bg-white dark:bg-white/[0.03] backdrop-blur-2xl p-4 shadow-sm dark:shadow-none">
+ 			<div className="flex items-start justify-between gap-3">
+ 				<div>
+-					<p className="text-[11px] uppercase tracking-[0.3em] font-semibold text-zinc-400 dark:text-zinc-500">
++					<p className="text-[10px] uppercase tracking-[0.18em] font-semibold text-zinc-400 dark:text-zinc-500">
+ 						{title}
+ 					</p>
+ 					{subtitle ? (
+-						<p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">{subtitle}</p>
++						<p className="mt-1.5 text-[12px] text-zinc-500 dark:text-zinc-400">{subtitle}</p>
+ 					) : null}
+ 				</div>
+ 			</div>
+-			<div className="mt-6">{children}</div>
++			<div className="mt-4">{children}</div>
+ 		</div>
+ 	);
+ }
+@@ -197,37 +197,37 @@ export default function RepoPage() {
+ 
+ 				<Sidebar />
+ 
+-				<div className="flex-1 px-8 py-8 h-screen overflow-y-auto">
++				<div className="flex-1 px-5 sm:px-7 xl:px-8 py-5 h-screen overflow-y-auto">
+ 
+ 					<Topbar />
+ 
+ 					{loading ? (
+ 						<>
+ 							<HeroSkeleton />
+-							<div className="mt-16">
+-								<div className="h-8 w-64 rounded-lg bg-zinc-200 dark:bg-white/[0.04] animate-pulse mb-8" />
++							<div className="mt-12">
++								<div className="h-8 w-64 rounded-lg bg-zinc-200 dark:bg-white/[0.04] animate-pulse mb-6" />
+ 								<CommitsSkeleton />
+ 							</div>
+ 						</>
+ 					) : (
+ 						<>
+ 							{/* ── hero ── */}
+-							<div className="mt-10 grid lg:grid-cols-[1.4fr_0.9fr] gap-6">
++							<div className="mt-7 grid lg:grid-cols-[1.4fr_0.9fr] gap-5">
+ 
+ 								{/* left — repo overview */}
+-								<div className="relative overflow-hidden rounded-[36px] border border-zinc-200/60 dark:border-white/10 bg-white dark:bg-white/[0.03] backdrop-blur-2xl p-10 shadow-sm dark:shadow-none">
+-									<div className="absolute top-[-120px] right-[-120px] w-[300px] h-[300px] bg-blue-500/10 dark:bg-blue-500/20 blur-[120px] rounded-full" />
++								<div className="relative overflow-hidden rounded-2xl border border-zinc-200/60 dark:border-white/10 bg-white dark:bg-white/[0.03] backdrop-blur-xl p-7 sm:p-8 shadow-sm dark:shadow-none">
++									<div className="absolute top-[-120px] right-[-120px] w-[260px] h-[260px] bg-blue-500/10 dark:bg-blue-500/20 blur-[120px] rounded-full" />
+ 
+ 									<div className="relative">
+-										<div className="flex flex-wrap items-center justify-between gap-4">
+-											<p className="text-indigo-600 dark:text-blue-300 text-sm uppercase tracking-[0.3em] font-semibold">
++										<div className="flex flex-wrap items-center justify-between gap-5">
++											<p className="text-indigo-600 dark:text-blue-300 text-[10px] uppercase tracking-[0.18em] font-semibold">
+ 												Repository Intelligence
+ 											</p>
+ 											{session && (
+ 												<button
+ 													onClick={handleManualSync}
+ 													disabled={syncing}
+-													className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold border transition-all duration-300 active:scale-95 select-none ${
++													className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-semibold border transition-all duration-300 active:scale-95 select-none ${
+ 														syncing
+ 															? "bg-indigo-500/10 border-indigo-500/30 text-indigo-500 cursor-not-allowed animate-pulse"
+ 															: "bg-indigo-500/10 dark:bg-indigo-500/5 border-indigo-500/20 hover:border-indigo-500/50 hover:bg-indigo-500/20 text-indigo-600 dark:text-indigo-300"
+@@ -239,42 +239,42 @@ export default function RepoPage() {
+ 											)}
+ 										</div>
+ 
+-										<h1 className="mt-6 text-5xl font-semibold tracking-tight leading-[1] text-zinc-900 dark:text-white break-all">
++										<h1 className="mt-5 text-3xl sm:text-4xl font-semibold tracking-[-0.04em] leading-[1.05] text-zinc-900 dark:text-white break-all">
+ 											{repoName.toUpperCase()}
+ 										</h1>
+ 
+-										<p className="mt-6 text-base text-zinc-500 dark:text-zinc-400 leading-relaxed max-w-2xl">
++										<p className="mt-4 text-[13px] text-zinc-500 dark:text-zinc-400 leading-relaxed max-w-2xl">
+ 											{repoDetails?.description || "No description provided for this repository."}
+ 										</p>
+ 
+-										<div className="flex flex-wrap gap-8 mt-12">
++										<div className="flex flex-wrap gap-5 mt-8">
+ 											<div className="flex items-center gap-3">
+-												<div className="w-10 h-10 rounded-xl bg-indigo-500/10 flex items-center justify-center">
+-													<GitCommit size={18} className="text-indigo-500" />
++												<div className="w-9 h-9 rounded-lg bg-indigo-500/10 flex items-center justify-center">
++													<GitCommit size={16} className="text-indigo-500" />
+ 												</div>
+ 												<div>
+-													<h3 className="text-2xl font-semibold text-zinc-900 dark:text-white">{commits.length}</h3>
+-													<p className="text-zinc-500 dark:text-zinc-500 text-sm mt-0.5">Commits synced</p>
++													<h3 className="text-xl font-semibold tracking-[-0.02em] text-zinc-900 dark:text-white">{commits.length}</h3>
++													<p className="text-zinc-500 dark:text-zinc-500 text-[11px] mt-0.5">Commits synced</p>
+ 												</div>
+ 											</div>
+ 											<div className="flex items-center gap-3">
+-												<div className="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center">
+-													<Star size={18} className="text-amber-500" />
++												<div className="w-9 h-9 rounded-lg bg-amber-500/10 flex items-center justify-center">
++													<Star size={16} className="text-amber-500" />
+ 												</div>
+ 												<div>
+-													<h3 className="text-2xl font-semibold text-zinc-900 dark:text-white">{repoDetails?.stars ?? 0}</h3>
+-													<p className="text-zinc-500 dark:text-zinc-500 text-sm mt-0.5">GitHub Stars</p>
++													<h3 className="text-xl font-semibold tracking-[-0.02em] text-zinc-900 dark:text-white">{repoDetails?.stars ?? 0}</h3>
++													<p className="text-zinc-500 dark:text-zinc-500 text-[11px] mt-0.5">GitHub Stars</p>
+ 												</div>
+ 											</div>
+ 											<div className="flex items-center gap-3">
+-												<div className="w-10 h-10 rounded-xl bg-cyan-500/10 flex items-center justify-center">
+-													<Code2 size={18} className="text-cyan-500" />
++												<div className="w-9 h-9 rounded-lg bg-cyan-500/10 flex items-center justify-center">
++													<Code2 size={16} className="text-cyan-500" />
+ 												</div>
+ 												<div>
+-													<h3 className="text-2xl font-semibold text-zinc-900 dark:text-white">
++													<h3 className="text-xl font-semibold tracking-[-0.02em] text-zinc-900 dark:text-white">
+ 														{repoDetails?.language || "Code"}
+ 													</h3>
+-													<p className="text-zinc-500 dark:text-zinc-500 text-sm mt-0.5">Primary Language</p>
++													<p className="text-zinc-500 dark:text-zinc-500 text-[11px] mt-0.5">Primary Language</p>
+ 												</div>
+ 											</div>
+ 										</div>
+@@ -282,23 +282,23 @@ export default function RepoPage() {
+ 								</div>
+ 
+ {/* right — development update */}
+-							<div className="rounded-[36px] border border-cyan-500/20 bg-cyan-500/[0.03] dark:bg-cyan-500/[0.05] backdrop-blur-2xl p-8 shadow-sm dark:shadow-none">
++							<div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/[0.03] dark:bg-cyan-500/[0.05] backdrop-blur-xl p-6 shadow-sm dark:shadow-none">
+ 								<div className="flex items-center gap-2 text-cyan-600 dark:text-cyan-300">
+ 									<Sparkles size={16} />
+-									<p className="text-sm uppercase tracking-[0.25em] font-semibold">
++									<p className="text-[10px] uppercase tracking-[0.16em] font-semibold">
+ 										Development Update
+ 									</p>
+ 								</div>
+ 
+-								<h2 className="mt-6 text-xl font-semibold leading-relaxed text-zinc-900 dark:text-white">
++								<h2 className="mt-4 text-[17px] font-semibold leading-relaxed text-zinc-900 dark:text-white">
+ 									{loading ? "Generating Repository Intelligence..." : developmentUpdate}
+ 								</h2>
+ 
+-								<div className="mt-8 rounded-[24px] border border-zinc-200/60 dark:border-white/10 bg-white/70 dark:bg-white/[0.03] p-5">
+-									<p className="text-xs uppercase tracking-[0.25em] font-semibold text-zinc-400 dark:text-zinc-500">
++								<div className="mt-6 rounded-xl border border-zinc-200/60 dark:border-white/10 bg-white/70 dark:bg-white/[0.03] p-4">
++									<p className="text-[10px] uppercase tracking-[0.16em] font-semibold text-zinc-400 dark:text-zinc-500">
+ 										Repository Overview
+ 									</p>
+-									<p className="mt-3 text-sm leading-relaxed text-zinc-600 dark:text-zinc-400 max-w-xl">
++									<p className="mt-2.5 text-[12px] leading-relaxed text-zinc-600 dark:text-zinc-400 max-w-xl">
+ 										{summaryText}
+ 									</p>
+ 									</div>
+@@ -307,74 +307,74 @@ export default function RepoPage() {
+ 							</div>
+ 
+ {/* ── intelligence sections ── */}
+-						<div className="mt-10 grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+-							<div className="space-y-6">
++						<div className="mt-7 grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
++							<div className="space-y-4">
+ 								<SectionCard
+ 									title="AI Insights"
+ 									subtitle="What matters most right now"
+ 								>
+-									<div className="space-y-6">
+-										<div className="rounded-[24px] border border-zinc-200/60 dark:border-white/10 bg-zinc-50/80 dark:bg-white/[0.02] p-5">
++									<div className="space-y-4">
++										<div className="rounded-xl border border-zinc-200/60 dark:border-white/10 bg-zinc-50/80 dark:bg-white/[0.02] p-4">
+ 											<div className="flex items-center gap-2 text-indigo-600 dark:text-indigo-300">
+ 												<Sparkles size={16} />
+-												<p className="text-sm font-semibold">Current Focus</p>
++												<p className="text-[12px] font-semibold">Current Focus</p>
+ 											</div>
+-											<p className="mt-3 text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">
++											<p className="mt-2.5 text-[12px] leading-relaxed text-zinc-600 dark:text-zinc-400">
+ 												{currentFocus}
+ 											</p>
+ 										</div>
+ 
+-										<div className="rounded-[24px] border border-zinc-200/60 dark:border-white/10 bg-zinc-50/80 dark:bg-white/[0.02] p-5">
++										<div className="rounded-xl border border-zinc-200/60 dark:border-white/10 bg-zinc-50/80 dark:bg-white/[0.02] p-4">
+ 											<div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
+ 												<CheckCircle2 size={16} />
+-												<p className="text-sm font-semibold">Completed Milestones</p>
++												<p className="text-[12px] font-semibold">Completed Milestones</p>
+ 											</div>
+ 											{completedMilestones.length > 0 ? (
+ 												<ul className="mt-3 space-y-2">
+ 													{completedMilestones.map((item, index) => (
+-														<li key={`${item}-${index}`} className="flex gap-2 text-sm text-zinc-600 dark:text-zinc-400">
++														<li key={`${item}-${index}`} className="flex gap-2 text-[12px] text-zinc-600 dark:text-zinc-400">
+ 															<CheckCircle2 size={14} className="mt-0.5 shrink-0 text-emerald-500" />
+ 															<span>{item}</span>
+ 														</li>
+ 													))}
+ 												</ul>
+ 											) : (
+-												<p className="mt-3 text-sm text-zinc-500 dark:text-zinc-400">No information available.</p>
++												<p className="mt-2.5 text-[12px] text-zinc-500 dark:text-zinc-400">No information available.</p>
+ 											)}
+ 										</div>
+ 
+-										<div className="rounded-[24px] border border-zinc-200/60 dark:border-white/10 bg-zinc-50/80 dark:bg-white/[0.02] p-5">
++										<div className="rounded-xl border border-zinc-200/60 dark:border-white/10 bg-zinc-50/80 dark:bg-white/[0.02] p-4">
+ 											<div className="flex items-center gap-2 text-amber-600 dark:text-amber-400">
+ 												<AlertCircle size={16} />
+-												<p className="text-sm font-semibold">Things to Review</p>
++												<p className="text-[12px] font-semibold">Things to Review</p>
+ 											</div>
+ 											{thingsToReview.length > 0 ? (
+ 												<ul className="mt-3 space-y-2">
+ 													{thingsToReview.map((item, index) => (
+-														<li key={`${item}-${index}`} className="flex gap-2 text-sm text-zinc-600 dark:text-zinc-400">
++														<li key={`${item}-${index}`} className="flex gap-2 text-[12px] text-zinc-600 dark:text-zinc-400">
+ 															<AlertCircle size={14} className="mt-0.5 shrink-0 text-amber-500" />
+ 															<span>{item}</span>
+ 														</li>
+ 													))}
+ 												</ul>
+ 											) : (
+-												<p className="mt-3 text-sm text-zinc-500 dark:text-zinc-400">No information available.</p>
++												<p className="mt-2.5 text-[12px] text-zinc-500 dark:text-zinc-400">No information available.</p>
+ 											)}
+ 										</div>
+ 									</div>
+ 								</SectionCard>
+ 							</div>
+ 
+-							<div className="space-y-6">
++							<div className="space-y-4">
+ 								<SectionCard title="Suggested Next Steps" subtitle="A concise path forward">
+ 									{nextPriorities.length > 0 ? (
+-										<ol className="space-y-3">
++										<ol className="space-y-2.5">
+ 											{nextPriorities.map((item, index) => (
+-												<li key={`${item}-${index}`} className="flex gap-3 rounded-[20px] border border-zinc-200/60 dark:border-white/10 bg-zinc-50/70 dark:bg-white/[0.02] p-4">
+-													<div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-indigo-500/10 text-sm font-semibold text-indigo-600 dark:text-indigo-300">
++												<li key={`${item}-${index}`} className="flex gap-3 rounded-xl border border-zinc-200/60 dark:border-white/10 bg-zinc-50/70 dark:bg-white/[0.02] p-4">
++													<div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-500/10 text-[12px] font-semibold text-indigo-600 dark:text-indigo-300">
+ 														{index + 1}
+ 													</div>
+-													<p className="text-sm leading-relaxed text-zinc-600 dark:text-zinc-400">{item}</p>
++													<p className="text-[12px] leading-relaxed text-zinc-600 dark:text-zinc-400">{item}</p>
+ 												</li>
+ 											))}
+ 										</ol>
+@@ -385,11 +385,11 @@ export default function RepoPage() {
+ 
+ 								<SectionCard title="Technologies" subtitle="Main stack and implementation focus">
+ 									{technologies.length > 0 ? (
+-										<div className="flex flex-wrap gap-2">
++										<div className="flex flex-wrap gap-1.5">
+ 											{technologies.map((tech, index) => (
+ 												<span
+ 													key={`${tech}-${index}`}
+-													className="inline-flex items-center rounded-full border border-zinc-200/70 bg-white/80 px-3 py-1.5 text-sm text-zinc-600 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-300"
++													className="inline-flex items-center rounded-full border border-zinc-200/70 bg-white/80 px-2.5 py-1 text-[12px] text-zinc-600 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-300"
+ 												>
+ 													{tech}
+ 												</span>
+@@ -403,57 +403,57 @@ export default function RepoPage() {
+ 						</div>
+ 
+ 						{/* ── commit timeline ── */}
+-							<div className="mt-16 pb-20">
++							<div className="mt-12 pb-20">
+ 
+-								<div className="flex items-end justify-between mb-8">
++								<div className="flex items-end justify-between mb-6">
+ 									<div>
+-										<p className="text-indigo-600 dark:text-blue-300 text-sm uppercase tracking-[0.25em] font-semibold">
++										<p className="text-indigo-600 dark:text-blue-300 text-[10px] uppercase tracking-[0.16em] font-semibold">
+ 											Commit Timeline
+ 										</p>
+-										<h2 className="text-4xl font-semibold mt-3 tracking-tight text-zinc-900 dark:text-white">
++										<h2 className="text-2xl sm:text-3xl font-semibold mt-2 tracking-[-0.03em] text-zinc-900 dark:text-white">
+ 											Recent development activity
+ 										</h2>
+ 									</div>
+-									<p className="text-zinc-500 dark:text-zinc-500 max-w-xs text-right text-sm">
++									<p className="text-zinc-500 dark:text-zinc-500 max-w-xs text-right text-[12px]">
+ 										Explore commit flow, architecture decisions, and repository evolution.
+ 									</p>
+ 								</div>
+ 
+ 								{commits.length === 0 ? (
+-									<div className="rounded-[28px] border border-dashed border-zinc-300 dark:border-white/10 bg-zinc-50 dark:bg-white/[0.02] p-16 text-center">
+-										<div className="w-14 h-14 rounded-2xl bg-indigo-500/10 flex items-center justify-center mx-auto mb-4">
+-											<GitCommit size={24} className="text-indigo-400" />
++									<div className="rounded-2xl border border-dashed border-zinc-300 dark:border-white/10 bg-zinc-50 dark:bg-white/[0.02] p-12 text-center">
++										<div className="w-12 h-12 rounded-xl bg-indigo-500/10 flex items-center justify-center mx-auto mb-3">
++											<GitCommit size={20} className="text-indigo-400" />
+ 										</div>
+-										<h3 className="text-lg font-semibold text-zinc-700 dark:text-zinc-300">
++										<h3 className="text-[15px] font-semibold text-zinc-700 dark:text-zinc-300">
+ 											No commits synced yet
+ 										</h3>
+-										<p className="text-zinc-400 dark:text-zinc-500 text-sm mt-2 max-w-xs mx-auto">
++										<p className="text-zinc-400 dark:text-zinc-500 text-[12px] mt-2 max-w-xs mx-auto">
+ 											Commits will appear here once the repository sync completes or the repo has commit history on GitHub.
+ 										</p>
+ 									</div>
+ 								) : (
+ 									<>
+-																			<div className="space-y-5">
++																			<div className="space-y-4">
+ 										{currentCommits.map((commit) => (
+ 											<div
+ 												key={commit.sha}
+-												className="group relative overflow-hidden rounded-[28px] border border-zinc-200/60 dark:border-white/10 bg-white dark:bg-white/[0.03] backdrop-blur-2xl p-7 hover:border-indigo-500/30 dark:hover:border-indigo-500/20 transition-all duration-500 shadow-sm dark:shadow-none"
++												className="group relative overflow-hidden rounded-xl border border-zinc-200/60 dark:border-white/10 bg-white dark:bg-white/[0.03] backdrop-blur-2xl p-4 hover:border-indigo-500/30 dark:hover:border-indigo-500/20 transition-all duration-500 shadow-sm dark:shadow-none"
+ 											>
+-												<div className="absolute top-[-60px] right-[-60px] w-[160px] h-[160px] bg-indigo-500/5 dark:bg-blue-500/10 blur-3xl rounded-full opacity-0 group-hover:opacity-100 transition duration-500" />
++												<div className="absolute top-[-60px] right-[-60px] w-[130px] h-[130px] bg-indigo-500/5 dark:bg-blue-500/10 blur-3xl rounded-full opacity-0 group-hover:opacity-100 transition duration-500" />
+ 
+-												<div className="relative flex items-start justify-between gap-6">
++												<div className="relative flex items-start justify-between gap-5">
+ 
+ 													<div className="flex-1 min-w-0">
+ 														{/* badge */}
+-														<div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/8 dark:bg-indigo-500/10 px-3 py-1 text-xs text-indigo-600 dark:text-indigo-300 mb-4 font-mono">
++														<div className="inline-flex items-center gap-2 rounded-full border border-indigo-500/20 bg-indigo-500/8 dark:bg-indigo-500/10 px-2.5 py-1 text-[11px] text-indigo-600 dark:text-indigo-300 mb-3 font-mono">
+ 															{commit.sha?.substring(0, 7)}
+ 														</div>
+ 
+-														<h3 className="text-lg font-semibold tracking-tight leading-snug text-zinc-900 dark:text-white line-clamp-2">
++														<h3 className="text-[15px] font-semibold tracking-tight leading-snug text-zinc-900 dark:text-white line-clamp-2">
+ 															{commit.message}
+ 														</h3>
+ 
+-														<p className="mt-3 text-zinc-500 dark:text-zinc-400 font-mono text-xs leading-relaxed">
++														<p className="mt-2 text-zinc-500 dark:text-zinc-400 font-mono text-[11px] leading-relaxed">
+ 															<span className="text-emerald-600 dark:text-emerald-400">+{commit.insertions ?? 0}</span>
+ 															{" "}additions,{" "}
+ 															<span className="text-rose-600 dark:text-rose-400">-{commit.deletions ?? 0}</span>
+@@ -464,13 +464,13 @@ export default function RepoPage() {
+ 													</div>
+ 
+ 													<div className="text-right shrink-0">
+-														<p className="text-xs text-zinc-400 dark:text-zinc-500 uppercase tracking-wider font-semibold">
++														<p className="text-[10px] text-zinc-400 dark:text-zinc-500 uppercase tracking-wider font-semibold">
+ 															Author
+ 														</p>
+-														<h4 className="mt-2 text-sm font-semibold text-zinc-800 dark:text-zinc-200">
++														<h4 className="mt-1.5 text-[12px] font-semibold text-zinc-800 dark:text-zinc-200">
+ 															{commit.author_name}
+ 														</h4>
+-														<p className="mt-2 text-xs text-zinc-400">
++														<p className="mt-2 text-[10px] text-zinc-400">
+ 															{new Date(commit.commit_timestamp).toLocaleDateString(undefined, {
+ 																year: "numeric",
+ 																month: "short",
+@@ -483,19 +483,19 @@ export default function RepoPage() {
+ 											</div>
+ 										))}
+ 									</div>
+-									<div className="flex justify-center items-center gap-3 mt-10">
+-										<button disabled={currentCommitPage==1} onClick={() => setCurrentCommitPage((p) => p - 1)} className="w-11 h-11 rounded-xl border border-white/10 bg-white/[0.03] disabled:opacity-40 hover:bg-white/[0.06] transition-all flex items-center justify-center">
++									<div className="flex justify-center items-center gap-2 mt-8">
++										<button disabled={currentCommitPage==1} onClick={() => setCurrentCommitPage((p) => p - 1)} className="w-9 h-9 rounded-lg border border-white/10 bg-white/[0.03] disabled:opacity-40 hover:bg-white/[0.06] transition-all flex items-center justify-center">
+ 											<ChevronLeft size={16}/>
+ 										</button>
+ 										{Array.from(
+ 											{length: totalCommitsPages},
+ 											(_, i) => i + 1,
+ 										).map((page) => (
+-											<button key={page} onClick={() => setCurrentCommitPage(page)} className={`w-11 h-11 rounded-xl transition-all ${currentCommitPage === page ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/30" : "border border-white/10 bg-white/[0.03] hover:bg-white/[0.06]"}`}>
++											<button key={page} onClick={() => setCurrentCommitPage(page)} className={`w-9 h-9 rounded-lg transition-all ${currentCommitPage === page ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/30" : "border border-white/10 bg-white/[0.03] hover:bg-white/[0.06]"}`}>
+ 												{page}
+ 											</button>
+ 										))}
+-										<button disabled={currentCommitPage===totalCommitsPages} onClick={() => setCurrentCommitPage((p) => p + 1)} className="w-11 h-11 rounded-xl border border-white/10 bg-white/[0.03] disabled:opacity-40 hover:bg-white/[0.06] transition-all flex items-center justify-center">
++										<button disabled={currentCommitPage===totalCommitsPages} onClick={() => setCurrentCommitPage((p) => p + 1)} className="w-9 h-9 rounded-lg border border-white/10 bg-white/[0.03] disabled:opacity-40 hover:bg-white/[0.06] transition-all flex items-center justify-center">
+ 											<ChevronRight size={16}/>
+ 										</button>
+ 									</div>
+diff --git a/frontend/components/RepoCard.tsx b/frontend/components/RepoCard.tsx
+index 8d88019..817d612 100644
+--- a/frontend/components/RepoCard.tsx
++++ b/frontend/components/RepoCard.tsx
+@@ -1,4 +1,5 @@
+ import Link from "next/link";
++import { ArrowUpRight, Clock3, Star } from "lucide-react";
+ 
+ interface Props {
+ 	name: string;
+@@ -10,75 +11,45 @@ interface Props {
+ 
+ function getRelativeTime(dateString: string){
+ 	const diff = Date.now() - new Date(dateString).getTime();
+-
+-	console.log(dateString)
+-
+ 	const minutes = Math.floor(diff / 60000);
+ 	
+-	if (minutes<1) return "Just now";
+-	if (minutes < 60) return `${minutes} min ago`
++	if (minutes < 1) return "Just now";
++	if (minutes < 60) return `${minutes} min ago`;
+ 
+ 	const hours = Math.floor(minutes / 60);
+-
+ 	if(hours < 24) return `${hours} hours ago`;
+ 
+ 	const days = Math.floor(hours / 24);
+-
+ 	return `${days} days ago`;
+ }
+ 
+-
+-
+ export default function RepoCard({ name, description, language, stars, last_synced_at }: Props) {
+ 	return (
+-		<Link href={`/repo/${name}`}>
+-			<div className="group relative overflow-hidden rounded-[24px] border border-zinc-200/60 dark:border-white/5 bg-white dark:bg-[#0b0f27]/40 backdrop-blur-3xl p-7 hover:border-indigo-500/35 dark:hover:border-indigo-500/35 transition-all duration-500 hover:-translate-y-1 cursor-pointer shadow-sm dark:shadow-xl dark:shadow-black/20">
+-
+-				{/* hover glow */}
+-				<div className="absolute top-[-80px] right-[-80px] w-[180px] h-[180px] bg-indigo-500/10 blur-3xl rounded-full opacity-0 group-hover:opacity-100 transition duration-500" />
+-
+-				<div className="relative">
+-
+-					<div className="flex items-start justify-between">
+-
+-						<div>
+-							<p className="text-zinc-500 dark:text-zinc-500 text-xs font-semibold uppercase tracking-wider">
+-								Repository
+-							</p>
+-							<h2 className="text-xl font-bold mt-2 tracking-tight text-zinc-900 dark:text-white group-hover:text-indigo-600 dark:group-hover:text-indigo-200 transition">
+-								{name}
+-							</h2>
+-						</div>
+-
+-						<div className="px-3 py-1 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-600 dark:text-indigo-300 text-xs font-mono font-medium whitespace-nowrap">
+-							Last Synced {getRelativeTime(last_synced_at)}
+-						</div>
+-
+-						<div className="px-3 py-1 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-600 dark:text-indigo-300 text-xs font-mono font-medium whitespace-nowrap">
+-							{language || "Code"}
+-						</div>
+-
++		<Link href={`/repo/${name}`} className="group block">
++			<div className="relative h-full overflow-hidden rounded-xl border border-zinc-200/70 dark:border-white/[0.07] bg-white/75 dark:bg-white/[0.025] p-5 shadow-sm dark:shadow-none transition-all duration-200 group-hover:-translate-y-0.5 group-hover:border-indigo-500/35 group-hover:shadow-md dark:group-hover:bg-white/[0.04]">
++				<div className="flex items-start justify-between gap-3">
++					<div className="min-w-0">
++						<p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-500">Repository</p>
++						<h2 className="mt-2 truncate text-[16px] font-semibold tracking-[-0.02em] text-zinc-900 transition-colors group-hover:text-indigo-600 dark:text-zinc-100 dark:group-hover:text-indigo-300">{name}</h2>
+ 					</div>
++					<ArrowUpRight size={16} className="mt-1 shrink-0 text-zinc-400 transition-transform duration-200 group-hover:-translate-y-0.5 group-hover:translate-x-0.5 group-hover:text-indigo-500" />
++				</div>
+ 
+-					<p className="mt-5 text-zinc-500 dark:text-zinc-400 text-sm leading-relaxed min-h-[56px] line-clamp-2">
+-						{description || "No description provided for this repository."}
+-					</p>
+-
+-					<div className="mt-6 pt-5 border-t border-zinc-100 dark:border-white/5 flex items-center justify-between">
+-
+-						<div className="flex items-center gap-1.5 text-amber-500 dark:text-yellow-400">
+-							<span className="text-sm">⭐</span>
+-							<span className="text-sm font-semibold">{stars}</span>
+-						</div>
+-
+-						<div className="text-xs font-semibold text-zinc-400 dark:text-zinc-500 group-hover:text-indigo-500 dark:group-hover:text-indigo-400 transition flex items-center gap-1">
+-							Open →
+-						</div>
++				<p className="mt-4 min-h-[40px] line-clamp-2 text-[12px] leading-relaxed text-zinc-500 dark:text-zinc-400">
++					{description || "No description provided for this repository."}
++				</p>
+ 
++				<div className="mt-5 flex items-center justify-between gap-3 border-t border-zinc-200/70 pt-4 dark:border-white/[0.06]">
++					<div className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
++						<Clock3 size={13} className="text-zinc-400" />
++						<span>{getRelativeTime(last_synced_at)}</span>
++					</div>
++					<div className="flex items-center gap-2.5">
++						<span className="rounded-md border border-indigo-500/15 bg-indigo-500/[0.07] px-2 py-1 text-[10px] font-medium text-indigo-600 dark:text-indigo-300">{language || "Code"}</span>
++						<span className="flex items-center gap-1 text-[11px] font-medium text-amber-600 dark:text-amber-400"><Star size={13} fill="currentColor" />{stars}</span>
+ 					</div>
+-
+ 				</div>
+ 			</div>
+ 		</Link>
+ 	);
+-}
++}
+\ No newline at end of file
+diff --git a/frontend/components/Sidebar.tsx b/frontend/components/Sidebar.tsx
+index a21feae..6ddc057 100644
+--- a/frontend/components/Sidebar.tsx
++++ b/frontend/components/Sidebar.tsx
+@@ -26,14 +26,14 @@ export default function Sidebar() {
+ 	return (
+ 		<div className="w-[270px] min-h-screen border-r border-zinc-200/50 dark:border-white/5 bg-[#fafafa] dark:bg-[#060a1f]/45 backdrop-blur-3xl px-6 py-8 transition-colors duration-300">
+ 			{/* logo */}
+-			<div className="flex items-center gap-4 mb-14">
++			<div className="flex items-center gap-3 px-2 mb-10">
+ 				<img 
+ 					src= "/meridian-icon.svg"
+ 					alt="Meridian Logo" 
+-					className="w-10 h-10 rounded-xl shadow-lg shadow-indigo-500/10 border border-zinc-200/50 dark:border-white/5" 
++					className="w-9 h-9 rounded-[10px] border border-zinc-200/80 dark:border-white/10 shadow-sm"
+ 				/>
+ 				<div>
+-					<h1 className="text-lg font-bold tracking-tight text-zinc-950 dark:text-white">
++					<h1 className="text-[15px] font-semibold tracking-[-0.02em] text-zinc-950 dark:text-zinc-100">
+ 						Meridian
+ 					</h1>
+ 					<p className="text-[10px] uppercase tracking-wider text-indigo-600 dark:text-indigo-400/80 font-bold">
+@@ -43,7 +43,7 @@ export default function Sidebar() {
+ 			</div>
+ 
+ 			{/* nav */}
+-			<div className="space-y-2">
++			<div className="space-y-1">
+ 				{items.map((item) => {
+ 					const Icon = item.icon;
+ 					const isActive = pathname === item.path;
+@@ -52,14 +52,14 @@ export default function Sidebar() {
+ 						<Link
+ 							key={item.label}
+ 							href={item.path}
+-							className={`w-full flex items-center gap-4 px-4.5 py-3.5 rounded-xl transition-all duration-200 border ${
++							className={`group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 border ${
+ 								isActive
+-									? "bg-indigo-500/10 border-indigo-500/25 text-indigo-600 dark:text-indigo-400 shadow-sm"
+-									: "text-zinc-600 dark:text-zinc-400 hover:text-indigo-500 dark:hover:text-indigo-400 hover:bg-zinc-100 dark:hover:bg-white/[0.03] border-transparent"
++									? "bg-indigo-500/10 dark:bg-indigo-400/[0.1] border-indigo-500/20 dark:border-indigo-400/20 text-indigo-700 dark:text-indigo-300 shadow-[inset_2px_0_0_#818cf8]"
++									: "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-200/55 dark:hover:bg-white/[0.045] border-transparent"
+ 							}`}
+ 						>
+-							<Icon size={16} />
+-							<span className="font-semibold text-xs tracking-wide">
++							<Icon size={16} strokeWidth={isActive ? 2.2 : 1.8} className="transition-transform duration-200 group-hover:scale-105" />
++							<span className="font-medium text-[12px] tracking-[-0.01em]">
+ 								{item.label}
+ 							</span>
+ 						</Link>
+@@ -68,7 +68,7 @@ export default function Sidebar() {
+ 			</div>
+ 
+ 			{/* bottom panel */}
+-			<div className="mt-16 rounded-[20px] border border-zinc-200/60 dark:border-white/5 bg-white dark:bg-white/[0.02] p-5 shadow-sm dark:shadow-2xl">
++			<div className="mt-16 rounded-xl border border-zinc-200/70 dark:border-white/[0.07] bg-white/70 dark:bg-white/[0.025] p-4 shadow-sm dark:shadow-none">
+ 				<p className="text-indigo-600 dark:text-indigo-300 text-[10px] font-bold uppercase tracking-wider">
+ 					Platform Status
+ 				</p>
+diff --git a/frontend/components/StatsCard.tsx b/frontend/components/StatsCard.tsx
+index 32a94f9..27cea0b 100644
+--- a/frontend/components/StatsCard.tsx
++++ b/frontend/components/StatsCard.tsx
+@@ -5,48 +5,25 @@ interface Props {
+ 	accent?: "indigo" | "cyan" | "emerald" | "rose";
+ }
+ 
+-const borderMap = {
+-	indigo: "border-l-indigo-500",
+-	cyan:   "border-l-cyan-500",
+-	emerald:"border-l-emerald-500",
+-	rose:   "border-l-rose-500",
+-};
+-
+-const valueColorMap = {
+-	indigo: "text-indigo-600 dark:text-indigo-400",
+-	cyan:   "text-cyan-600 dark:text-cyan-400",
+-	emerald:"text-emerald-600 dark:text-emerald-400",
+-	rose:   "text-rose-600 dark:text-rose-400",
+-};
+-
+-const bgGlowMap = {
+-	indigo: "bg-indigo-500/5 dark:bg-indigo-500/10 group-hover:bg-indigo-500/15",
+-	cyan:   "bg-cyan-500/5 dark:bg-cyan-500/10 group-hover:bg-cyan-500/15",
+-	emerald:"bg-emerald-500/5 dark:bg-emerald-500/10 group-hover:bg-emerald-500/15",
+-	rose:   "bg-rose-500/5 dark:bg-rose-500/10 group-hover:bg-rose-500/15",
++const accentMap = {
++	indigo: "border-l-indigo-400 text-indigo-600 dark:text-indigo-300",
++	cyan: "border-l-cyan-400 text-cyan-600 dark:text-cyan-300",
++	emerald: "border-l-emerald-400 text-emerald-600 dark:text-emerald-300",
++	rose: "border-l-rose-400 text-rose-600 dark:text-rose-300",
+ };
+ 
+ export default function StatsCard({ title, value, subtitle, accent = "indigo" }: Props) {
+ 	return (
+-		<div className={`relative overflow-hidden rounded-[24px] border border-zinc-200/60 dark:border-white/5 border-l-[5px] ${borderMap[accent]} bg-white dark:bg-[#0b0f27]/45 backdrop-blur-3xl p-6 hover:border-indigo-500/30 dark:hover:border-indigo-500/30 transition-all duration-500 shadow-sm dark:shadow-xl dark:shadow-black/10 group`}>
+-
+-			{/* glow */}
+-			<div className={`absolute top-[-60px] right-[-60px] w-[140px] h-[140px] ${bgGlowMap[accent]} blur-3xl rounded-full transition duration-500`} />
+-
+-			<div className="relative">
+-				<p className="text-zinc-500 dark:text-zinc-500 text-xs font-semibold uppercase tracking-wider">
+-					{title}
+-				</p>
+-
+-				<h2 className={`text-3xl font-extrabold mt-5 tracking-tight ${valueColorMap[accent] || "text-zinc-900 dark:text-white"}`}>
+-					{value}
+-				</h2>
+-
+-				<p className="text-zinc-500 dark:text-zinc-400 mt-4 text-xs font-semibold leading-relaxed">
+-					{subtitle}
+-				</p>
+-			</div>
++		<div className={`group rounded-xl border border-zinc-200/70 dark:border-white/[0.07] border-l-[3px] ${accentMap[accent]} bg-white/75 dark:bg-white/[0.025] p-5 shadow-sm dark:shadow-none transition-all duration-200 hover:-translate-y-0.5 hover:border-zinc-300 dark:hover:border-white/[0.13]`}>
++			<p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-500">
++				{title}
++			</p>
++			<h2 className="mt-3 truncate text-[23px] font-semibold tracking-[-0.03em] text-zinc-900 dark:text-zinc-100">
++				{value}
++			</h2>
++			<p className="mt-2 text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
++				{subtitle}
++			</p>
+ 		</div>
+ 	);
+-}
+-
++}
+\ No newline at end of file
+diff --git a/frontend/components/Topbar.tsx b/frontend/components/Topbar.tsx
+index ddf5dae..d341d87 100644
+--- a/frontend/components/Topbar.tsx
++++ b/frontend/components/Topbar.tsx
+@@ -44,12 +44,12 @@ export default function Topbar() {
+ 	}
+ 
+ 	return (
+-		<div className="flex items-center justify-between py-4 border-b border-zinc-200/50 dark:border-white/5 transition-colors duration-300">
++		<div className="flex items-center justify-between gap-5 py-4 border-b border-zinc-200/70 dark:border-white/[0.07] transition-colors duration-200">
+ 			<div>
+-				<p className="text-zinc-400 dark:text-zinc-500 text-xs font-semibold uppercase tracking-wider">
++				<p className="text-zinc-500 dark:text-zinc-500 text-[10px] font-semibold uppercase tracking-[0.14em]">
+ 					Developer Workspace
+ 				</p>
+-				<h1 className="text-2xl font-bold mt-1 tracking-tight text-zinc-900 dark:text-white">
++				<h1 className="text-[21px] font-semibold mt-1 tracking-[-0.03em] text-zinc-900 dark:text-zinc-100">
+ 					Your engineering activity,
+ 					<span className="text-indigo-500 dark:text-indigo-400 font-medium">
+ 						{" "}visualized.
+@@ -57,15 +57,15 @@ export default function Topbar() {
+ 				</h1>
+ 			</div>
+ 
+-			<div className="flex items-center gap-3">
+-				<button disabled={syncing} className="flex items-center gap-2 px-3 py-2 rounded-xl border border-zinc-200/60 dark:border-white/5 bg-white dark:bg-white/[0.02] hover:border-indigo-500/30 hover:bg-zinc-50 dark:hover:bg-white/[0.05] transition shadow-sm dark:shadow-none" onClick={syncRepos}>
++			<div className="flex items-center gap-2 sm:gap-2.5">
++				<button disabled={syncing} className="flex items-center gap-2 px-3 py-2 rounded-lg border border-zinc-200/80 dark:border-white/[0.08] bg-white dark:bg-white/[0.02] hover:border-indigo-500/30 hover:bg-zinc-50 dark:hover:bg-white/[0.05] transition shadow-sm dark:shadow-none" onClick={syncRepos}>
+ 					<RefreshCw
+ 						size={14}
+ 						className={syncing ? "animate-spin" : ""}
+ 					/>{syncing ? "Syncing..." : "Sync Repositories"}
+ 				</button>
+ 				{/* Search bar */}
+-				<div className="flex items-center gap-3 rounded-xl border border-zinc-200/60 dark:border-white/5 bg-white dark:bg-white/[0.02] px-4 py-2 shadow-sm dark:shadow-none transition focus-within:border-indigo-500/40 dark:focus-within:border-indigo-500/30">
++				<div className="flex items-center gap-2 sm:gap-2.5 rounded-lg border border-zinc-200/80 dark:border-white/[0.08] bg-white dark:bg-white/[0.02] px-4 py-2 shadow-sm dark:shadow-none transition focus-within:border-indigo-500/40 dark:focus-within:border-indigo-500/30">
+ 
+ 					<Search size={16} className="text-zinc-400 dark:text-zinc-500 shrink-0" />
+ 					<input
+@@ -73,7 +73,7 @@ export default function Topbar() {
+ 						placeholder="Search repositories..."
+ 						value={searchQuery}
+ 						onChange={(e) => setSearchQuery(e.target.value)}
+-						className="bg-transparent outline-none text-xs text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 w-44 focus:w-56 transition-all duration-300"
++						className="bg-transparent outline-none text-[11px] text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 w-36 md:w-44 focus:w-52 transition-all duration-200"
+ 					/>
+ 					{searchQuery && (
+ 						<button
+@@ -89,7 +89,7 @@ export default function Topbar() {
+ 				{/* Theme Toggle Button */}
+ 				<button
+ 					onClick={toggleTheme}
+-					className="w-10 h-10 rounded-xl border border-zinc-200/60 dark:border-white/5 bg-white dark:bg-white/[0.02] flex items-center justify-center text-zinc-600 dark:text-zinc-400 hover:text-indigo-500 dark:hover:text-indigo-400 hover:border-indigo-500/30 transition shadow-sm dark:shadow-none"
++					className="w-10 h-10 rounded-lg border border-zinc-200/80 dark:border-white/[0.08] bg-white dark:bg-white/[0.02] flex items-center justify-center text-zinc-600 dark:text-zinc-400 hover:text-indigo-500 dark:hover:text-indigo-400 hover:border-indigo-500/30 transition shadow-sm dark:shadow-none"
+ 					title={theme === "light" ? "Switch to Dark Mode" : "Switch to Light Mode"}
+ 				>
+ 					{theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
+@@ -101,7 +101,7 @@ export default function Topbar() {
+ 					<div className="relative" ref={dropdownRef}>
+ 						<button
+ 							onClick={() => setDropdownOpen(!dropdownOpen)}
+-							className="flex items-center gap-2 p-1.5 rounded-xl border border-zinc-200/60 dark:border-white/5 bg-white dark:bg-white/[0.02] hover:border-indigo-500/30 hover:bg-zinc-50 dark:hover:bg-white/[0.05] transition shadow-sm dark:shadow-none"
++							className="flex items-center gap-2 p-1.5 rounded-lg border border-zinc-200/80 dark:border-white/[0.08] bg-white dark:bg-white/[0.02] hover:border-indigo-500/30 hover:bg-zinc-50 dark:hover:bg-white/[0.05] transition shadow-sm dark:shadow-none"
+ 						>
+ 							{session.user.image ? (
+ 								<img
+@@ -114,16 +114,16 @@ export default function Topbar() {
+ 									<User size={14} />
+ 								</div>
+ 							)}
+-							<span className="hidden md:inline text-xs font-semibold text-zinc-700 dark:text-zinc-300 px-1">
++							<span className="hidden lg:inline text-[11px] font-medium text-zinc-700 dark:text-zinc-300 px-1">
+ 								{session.user.name?.split(" ")[0]}
+ 							</span>
+-							<ChevronDown size={14} className="text-zinc-400" />
++							<ChevronDown size={13} className="text-zinc-400" />
+ 						</button>
+ 
+ 						{dropdownOpen && (
+-							<div className="absolute right-0 mt-2 w-56 rounded-xl border border-zinc-200/60 dark:border-white/5 bg-white dark:bg-[#0c102b] p-2.5 shadow-xl shadow-zinc-200/50 dark:shadow-black/40 z-50 transform origin-top-right transition duration-250">
++							<div className="absolute right-0 mt-2 w-56 rounded-lg border border-zinc-200/80 dark:border-white/[0.08] bg-white dark:bg-[#0c102b] p-2.5 shadow-xl shadow-zinc-200/50 dark:shadow-black/40 z-50 transform origin-top-right transition duration-250">
+ 								<div className="px-3.5 py-2.5 border-b border-zinc-150 dark:border-white/5 mb-2">
+-									<p className="text-xs font-bold text-zinc-900 dark:text-white truncate">
++									<p className="text-[11px] font-semibold text-zinc-900 dark:text-zinc-100 truncate">
+ 										{session.user.name}
+ 									</p>
+ 									<p className="text-[10px] text-zinc-500 dark:text-zinc-400 truncate mt-0.5">
+@@ -134,7 +134,7 @@ export default function Topbar() {
+ 								<Link
+ 									href="/profile"
+ 									onClick={() => setDropdownOpen(false)}
+-									className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-xs font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-white/[0.05] hover:text-indigo-500 dark:hover:text-indigo-400 transition"
++									className="w-full flex items-center gap-2 sm:gap-2.5 px-3 py-2 rounded-lg text-xs font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-white/[0.05] hover:text-indigo-500 dark:hover:text-indigo-400 transition"
+ 								>
+ 									<User size={14} />
+ 									View Profile
+@@ -145,7 +145,7 @@ export default function Topbar() {
+ 										setDropdownOpen(false);
+ 										signOut({ callbackUrl: "/" });
+ 									}}
+-									className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition mt-1"
++									className="w-full flex items-center gap-2 sm:gap-2.5 px-3 py-2 rounded-lg text-xs font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition mt-1"
+ 								>
+ 									<LogOut size={14} />
+ 									Sign Out

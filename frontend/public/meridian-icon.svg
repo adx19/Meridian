@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img">
+  <title>Meridian Icon Mark</title>
+  <desc>Meridian geometric icon — meridian crosshair with git commit node graph</desc>
+
+  <rect width="200" height="200" fill="#0a0a0f"/>
+
+  <g transform="translate(100,100)">
+
+    <!-- Outer arc ring — partial, elegant -->
+    <circle cx="0" cy="0" r="62" fill="none" stroke="rgba(240,240,248,0.05)" stroke-width="1"/>
+    <circle cx="0" cy="0" r="44" fill="none" stroke="rgba(240,240,248,0.07)" stroke-width="0.75"/>
+
+    <!-- Quadrant tick marks at ring -->
+    <line x1="0" y1="-64" x2="0" y2="-58" stroke="rgba(110,231,183,0.5)" stroke-width="1.25" stroke-linecap="round"/>
+    <line x1="0" y1="58" x2="0" y2="64" stroke="rgba(110,231,183,0.2)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="-64" y1="0" x2="-58" y2="0" stroke="rgba(110,231,183,0.2)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="58" y1="0" x2="64" y2="0" stroke="rgba(110,231,183,0.2)" stroke-width="1" stroke-linecap="round"/>
+
+    <!-- Meridian vertical — the precise axis -->
+    <line x1="0" y1="-68" x2="0" y2="68" stroke="#6EE7B7" stroke-width="1.25" stroke-linecap="round"/>
+
+    <!-- Horizontal cross — short tick, precision feel -->
+    <line x1="-68" y1="0" x2="-22" y2="0" stroke="rgba(110,231,183,0.22)" stroke-width="0.75" stroke-linecap="round"/>
+    <line x1="22" y1="0" x2="68" y2="0" stroke="rgba(110,231,183,0.22)" stroke-width="0.75" stroke-linecap="round"/>
+
+    <!-- Node connector lines — git branch geometry -->
+    <line x1="0" y1="-44" x2="0" y2="-7" stroke="rgba(167,139,250,0.45)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="38" y1="-22" x2="6" y2="-3" stroke="rgba(167,139,250,0.35)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="-38" y1="22" x2="-6" y2="3" stroke="rgba(167,139,250,0.35)" stroke-width="1" stroke-linecap="round"/>
+
+    <!-- Cross-branch connector — subtle -->
+    <line x1="38" y1="-22" x2="0" y2="-44" stroke="rgba(240,240,248,0.08)" stroke-width="0.75" stroke-linecap="round"/>
+    <line x1="-38" y1="22" x2="-38" y2="42" stroke="rgba(240,240,248,0.06)" stroke-width="0.75" stroke-linecap="round"/>
+
+    <!-- Ghost trailing dot -->
+    <circle cx="-38" cy="42" r="2.5" fill="none" stroke="rgba(167,139,250,0.18)" stroke-width="1"/>
+
+    <!-- Commit dot — top (emerald) -->
+    <circle cx="0" cy="-44" r="5.5" fill="#0a0a0f" stroke="#6EE7B7" stroke-width="1.5"/>
+    <circle cx="0" cy="-44" r="2" fill="#6EE7B7"/>
+
+    <!-- Commit dot — right (violet) -->
+    <circle cx="38" cy="-22" r="4.5" fill="#0a0a0f" stroke="#A78BFA" stroke-width="1.25"/>
+    <circle cx="38" cy="-22" r="1.6" fill="#A78BFA"/>
+
+    <!-- Commit dot — left (violet) -->
+    <circle cx="-38" cy="22" r="4.5" fill="#0a0a0f" stroke="#A78BFA" stroke-width="1.25"/>
+    <circle cx="-38" cy="22" r="1.6" fill="#A78BFA"/>
+
+    <!-- Central peak node — the meridian moment -->
+    <circle cx="0" cy="0" r="8" fill="#0a0a0f" stroke="#6EE7B7" stroke-width="1.5"/>
+    <circle cx="0" cy="0" r="3" fill="#6EE7B7"/>
+
+  </g>
+</svg>

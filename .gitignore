@@ -1,0 +1,140 @@
+# =========================
+# ENV / SECRETS
+# =========================
+
+.env
+.env.*
+!.env.example
+
+# =========================
+# NODE / JAVASCRIPT
+# =========================
+
+node_modules/
+.next/
+.nuxt/
+.svelte-kit/
+dist/
+build/
+out/
+coverage/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+.cache/
+.parcel-cache/
+.turbo/
+
+# =========================
+# PYTHON
+# =========================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+venv/
+.venv/
+env/
+ENV/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+*.egg-info/
+.eggs/
+
+# =========================
+# DATABASES
+# =========================
+
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# LOGS
+# =========================
+
+*.log
+logs/
+
+# =========================
+# IDE / EDITORS
+# =========================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS FILES
+# =========================
+
+.DS_Store
+Thumbs.db
+
+# =========================
+# DOCKER
+# =========================
+
+docker-compose.override.yml
+*.pid
+
+# =========================
+# TEST / REPORTS
+# =========================
+
+htmlcov/
+.coverage
+coverage.xml
+
+# =========================
+# TEMP FILES
+# =========================
+
+tmp/
+temp/
+*.tmp
+
+# =========================
+# C/C++ / BUILD
+# =========================
+
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+
+# =========================
+# JAVA
+# =========================
+
+target/
+*.class
+*.jar
+
+# =========================
+# RUST
+# =========================
+
+target/
+
+# =========================
+# GO
+# =========================
+
+bin/
+
+# =========================
+# MISC
+# =========================
+
+*.bak
+*.orig

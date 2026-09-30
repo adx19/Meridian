@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img">
+  <title>Meridian Icon Mark (Dark Mode)</title>
+  <desc>Meridian geometric icon on white — for use in dark mode interfaces</desc>
+
+  <rect width="200" height="200" fill="#ffffff"/>
+
+  <g transform="translate(100,100)">
+    <circle cx="0" cy="0" r="62" fill="none" stroke="rgba(0,0,0,0.06)" stroke-width="1"/>
+    <circle cx="0" cy="0" r="44" fill="none" stroke="rgba(0,0,0,0.08)" stroke-width="0.75"/>
+
+    <line x1="0" y1="-64" x2="0" y2="-58" stroke="rgba(5,150,105,0.65)" stroke-width="1.25" stroke-linecap="round"/>
+    <line x1="0" y1="58" x2="0" y2="64" stroke="rgba(5,150,105,0.25)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="-64" y1="0" x2="-58" y2="0" stroke="rgba(5,150,105,0.25)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="58" y1="0" x2="64" y2="0" stroke="rgba(5,150,105,0.25)" stroke-width="1" stroke-linecap="round"/>
+
+    <line x1="0" y1="-68" x2="0" y2="68" stroke="#059669" stroke-width="1.25" stroke-linecap="round"/>
+    <line x1="-68" y1="0" x2="-22" y2="0" stroke="rgba(5,150,105,0.22)" stroke-width="0.75" stroke-linecap="round"/>
+    <line x1="22" y1="0" x2="68" y2="0" stroke="rgba(5,150,105,0.22)" stroke-width="0.75" stroke-linecap="round"/>
+
+    <line x1="0" y1="-44" x2="0" y2="-7" stroke="rgba(109,40,217,0.45)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="38" y1="-22" x2="6" y2="-3" stroke="rgba(109,40,217,0.35)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="-38" y1="22" x2="-6" y2="3" stroke="rgba(109,40,217,0.35)" stroke-width="1" stroke-linecap="round"/>
+    <line x1="38" y1="-22" x2="0" y2="-44" stroke="rgba(0,0,0,0.09)" stroke-width="0.75" stroke-linecap="round"/>
+    <line x1="-38" y1="22" x2="-38" y2="42" stroke="rgba(0,0,0,0.07)" stroke-width="0.75" stroke-linecap="round"/>
+    <circle cx="-38" cy="42" r="2.5" fill="none" stroke="rgba(109,40,217,0.2)" stroke-width="1"/>
+
+    <circle cx="0" cy="-44" r="5.5" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+    <circle cx="0" cy="-44" r="2" fill="#059669"/>
+    <circle cx="38" cy="-22" r="4.5" fill="#ffffff" stroke="#7C3AED" stroke-width="1.25"/>
+    <circle cx="38" cy="-22" r="1.6" fill="#7C3AED"/>
+    <circle cx="-38" cy="22" r="4.5" fill="#ffffff" stroke="#7C3AED" stroke-width="1.25"/>
+    <circle cx="-38" cy="22" r="1.6" fill="#7C3AED"/>
+
+    <circle cx="0" cy="0" r="8" fill="#ffffff" stroke="#059669" stroke-width="1.5"/>
+    <circle cx="0" cy="0" r="3" fill="#059669"/>
+  </g>
+</svg>
